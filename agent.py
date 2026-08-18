@@ -18,10 +18,17 @@ from livekit.agents import (
 from livekit.plugins import noise_cancellation, silero
 
 from prompts import INSTRUCTIONS, WELCOME_MESSAGE
+from services.kb_client import kb_client
 
 load_dotenv()
-TAVILY_API_KEY= os.getenv("TAVILY_API_KEY", "")
 logger = logging.getLogger("nxb-voice-agent")
+
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+RELEVANCE_THRESHOLD = 0.35
 
 
 class Assistant(Agent):
@@ -29,8 +36,27 @@ class Assistant(Agent):
         super().__init__(instructions=INSTRUCTIONS)
 
     @function_tool()
+    async def retrieve_company_info(self, context: RunContext, query: str) -> str:
+        """Search Nextbridge's internal knowledge base for company-related
+        information (services, team, projects, policies, contact info,
+        technologies, clients, etc.). Always call this FIRST for any
+        Nextbridge-related question before using web search.
+
+        Args:
+            query: The user's question, rephrased as a concise search query.
+        """
+        results = await kb_client.search(query, top_k=3)
+        relevant = [r for r in results if r.get("score", 0) >= RELEVANCE_THRESHOLD]
+
+        if not relevant:
+            return "NO_RELEVANT_INFO_FOUND"
+
+        return "\n\n".join(r["text"] for r in relevant)
+
+    @function_tool()
     async def web_search_nxb(self, context: RunContext, query: str) -> str:
-        """Search the web for information about Nextbridge (NXB). Always
+        """Search the web for information about Nextbridge (NXB), ONLY to be
+        used when retrieve_company_info returns no relevant result. Always
         scope the query strictly to Nextbridge/NXB.
 
         Args:
@@ -63,7 +89,9 @@ class Assistant(Agent):
             raise ToolError(f"Web search failed: {e}")
 
 
-server = AgentServer()
+server = AgentServer(
+    multiprocessing_context="spawn",
+)
 
 
 @server.rtc_session()

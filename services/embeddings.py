@@ -1,48 +1,22 @@
-import os
-import httpx
 import numpy as np
+from sentence_transformers import SentenceTransformer
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "https://herb-petite-era-glasses.trycloudflare.com")
-EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "mistral-nemo:latest")
-
-_dim_cache: int | None = None
-
-
-async def embed_text(text: str) -> np.ndarray:
-    async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(
-            f"{OLLAMA_BASE_URL}/api/embeddings",
-            json={"model": EMBED_MODEL, "prompt": text},
-        )
-        response.raise_for_status()
-        data = response.json()
-    return np.array(data["embedding"], dtype="float32")
+_MODEL_NAME = "all-MiniLM-L6-v2"  # small, fast, 384-dim, runs locally on CPU
+_model = None
 
 
-def _normalize(vec: np.ndarray) -> np.ndarray:
-    norm = np.linalg.norm(vec)
-    if norm == 0:
-        norm = 1e-10
-    return (vec / norm).astype("float32")
+def get_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        _model = SentenceTransformer(_MODEL_NAME)
+    return _model
 
 
-async def embed_texts(texts: list[str]) -> np.ndarray:
-    """Ollama's /api/embeddings takes one prompt at a time, so we loop."""
-    vectors = []
-    for t in texts:
-        vec = await embed_text(t)
-        vectors.append(_normalize(vec))
-    return np.vstack(vectors)
+def embed_texts(texts: list[str]) -> np.ndarray:
+    model = get_model()
+    embeddings = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+    return embeddings.astype("float32")
 
 
-async def embed_query(query: str) -> np.ndarray:
-    vec = await embed_text(query)
-    return _normalize(vec)
-
-
-async def get_embedding_dim() -> int:
-    global _dim_cache
-    if _dim_cache is None:
-        vec = await embed_text("dimension probe")
-        _dim_cache = len(vec)
-    return _dim_cache
+def embed_query(query: str) -> np.ndarray:
+    return embed_texts([query])[0]

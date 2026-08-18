@@ -10,8 +10,7 @@ data/faiss_index/
 
 
 data/*.pdf
-dafa/*
 
-
+KMS
 # uv
 .python-version

@@ -1,36 +1,72 @@
 # NXB Voice Agent
 
-A LiveKit-based voice agent for Nextbridge (NXB). Listens, responds in real time,
-and can search the web (scoped to Nextbridge) when it needs current information.
+A LiveKit-based voice agent for Nextbridge (NXB) with a web frontend. The agent
+answers questions using company knowledge (via a local FAISS knowledge base
+built from PDFs) and falls back to a web search scoped to Nextbridge when it
+doesn't have an answer internally.
+
+## Architecture
+
+```
+┌──────────────────┐      joins room       ┌─────────────────────┐
+│  nxb-voice-       │ ────────────────────► │   LiveKit Cloud      │
+│  frontend         │                        │   (room + signaling)│
+│  (Next.js)        │ ◄──────────────────── │                      │
+└─────────┬─────────┘      audio/data        └──────────┬───────────┘
+          │ GET /token                                   │ dispatches job
+          ▼                                               ▼
+┌──────────────────┐                          ┌─────────────────────┐
+│  nxb-voice-agent  │                          │  nxb-voice-agent     │
+│  ingest_api.py     │                          │  agent.py (worker)   │
+│  (FastAPI:8000)   │                          │  retrieve_company_info│
+│  - /token          │                          │  web_search_nxb       │
+│  - /ingest          │                          └─────────┬───────────┘
+└─────────┬─────────┘                                       │
+          │ builds                                           │ queries
+          ▼                                                   ▼
+   data/faiss_index/  ◄─────────────────────────────  services/kb_client.py
+   (FAISS + metadata, built from PDFs in data/)
+```
 
 ## Stack
 
-- **LiveKit Agents SDK** (Python) for the real-time voice pipeline
-- **LiveKit Inference** for STT/LLM/TTS — no separate OpenAI/Deepgram/Cartesia
-  keys needed, only LiveKit credentials
-- **Tavily** for web search, scoped to Nextbridge/NXB
-- **uv** for Python dependency management
+- **LiveKit Agents SDK** (Python) — real-time voice pipeline
+- **LiveKit Inference** — STT/LLM/TTS, no separate provider keys needed
+- **sentence-transformers + FAISS** — local knowledge base retrieval (no external API)
+- **Tavily** — web search, scoped to Nextbridge/NXB, used as fallback
+- **FastAPI** — ingestion endpoint (`/ingest`) + token endpoint (`/token`)
+- **Next.js + LiveKit Components React** — frontend voice UI
+- **uv** — Python dependency management
 
-## Prerequisites
+---
 
-- Python 3.12
+## Backend setup (`nxb-voice-agent/`)
+
+### Prerequisites
+
+- Python 3.12 (a clean system/uv-managed interpreter — **not** a Conda-based
+  one; Conda Python builds have caused library-loading issues in this project)
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- A [LiveKit Cloud](https://cloud.livekit.io/) account (free) — get your
-  `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+- A [LiveKit Cloud](https://cloud.livekit.io/) account — get `LIVEKIT_URL`,
+  `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
 - A [Tavily](https://tavily.com) API key (free tier available)
 - **PortAudio** installed at the OS level, for local console testing:
   ```bash
   sudo apt install portaudio19-dev
   ```
 
-## Setup
+### Install
 
 ```bash
+cd nxb-voice-agent
+uv venv --python 3.12.3      # use a clean, non-Conda Python
 uv sync
 uv run agent.py download-files   # downloads VAD / turn-detector model files
 ```
 
-Create a `.env` file in the project root:
+### `.env`
+
+Create a `.env` file in `nxb-voice-agent/`:
 
 ```ini
 LIVEKIT_URL=wss://your-project.livekit.cloud
@@ -40,41 +76,137 @@ LIVEKIT_API_SECRET=your-api-secret
 TAVILY_API_KEY=tvly-your-tavily-key
 ```
 
-## Running
+### 1. Build the knowledge base
 
-Console mode (talk to the agent locally via mic/speaker):
+Put your source PDFs in `data/`, then run the ingestion API:
 
 ```bash
-uv run agent.py console
+uv run uvicorn ingest_api:app --reload --port 8000
 ```
 
-Dev mode (connects to LiveKit Cloud for testing via a real room):
+In another terminal:
+
+```bash
+curl -X POST http://localhost:8000/ingest
+```
+
+This chunks the PDFs, embeds them locally (sentence-transformers,
+`all-MiniLM-L6-v2`), and builds `data/faiss_index/` (index + metadata).
+Re-run `/ingest` any time the source PDFs change — it rebuilds the index
+from scratch.
+
+Keep this FastAPI server (`ingest_api.py`) running — it also serves the
+`/token` endpoint the frontend needs (see below).
+
+### 2. Run the voice agent worker
 
 ```bash
 uv run agent.py dev
 ```
 
-Press `Ctrl+C` to stop.
+This registers a worker with LiveKit Cloud and waits for jobs (i.e. someone
+joining the room). Leave this running alongside the FastAPI server above.
+
+For quick local testing without a frontend (talks through your mic/speakers
+directly, no LiveKit room needed):
+
+```bash
+uv run agent.py console
+```
+
+### How the agent decides what to say
+
+1. `retrieve_company_info` — always tried first, searches the local FAISS
+   knowledge base built from your PDFs
+2. `web_search_nxb` — used only if retrieval finds nothing relevant; scopes
+   the query to Nextbridge/NXB via Tavily
+3. If neither returns anything useful, the agent says so honestly rather
+   than guessing
+
+See `prompts.py` for the exact instructions given to the agent.
+
+---
+
+## Frontend setup (`nxb-voice-frontend/`)
+
+### Prerequisites
+
+- Node.js 18+
+- The backend's FastAPI server (`ingest_api.py`) running on port 8000 for
+  the `/token` endpoint
+- The agent worker (`agent.py dev`) running so it can pick up jobs
+
+### Install
+
+```bash
+cd nxb-voice-frontend
+npm install
+```
+
+### `.env.local`
+
+```ini
+NEXT_PUBLIC_LIVEKIT_TOKEN_ENDPOINT=http://localhost:8000/token
+```
+
+### Run
+
+```bash
+npm run dev
+```
+
+Open `http://localhost:3000`, click **"Talk to Nextbridge"**. This:
+1. Calls `/token` on the backend to get a LiveKit access token
+2. Joins a LiveKit room
+3. The agent worker picks up the job automatically and joins the same room
+4. You get a live mic UI with voice-activity visualization
+
+---
+
+## Running everything together
+
+Four processes, each in its own terminal:
+
+```bash
+# 1 — knowledge base + token API
+cd nxb-voice-agent
+uv run uvicorn ingest_api:app --reload --port 8000
+
+# 2 — voice agent worker
+cd nxb-voice-agent
+uv run agent.py dev
+
+# 3 — frontend
+cd nxb-voice-frontend
+npm run dev
+```
+
+Then open `http://localhost:3000`.
+
+---
 
 ## Project structure
 
 ```
 nxb-voice-agent/
-├── .env                 # LiveKit + Tavily credentials (not committed)
-├── agent.py              # entrypoint — session setup, Assistant class, web_search_nxb tool
-├── prompts.py            # system instructions + welcome message
+├── .env                     # LiveKit + Tavily credentials (not committed)
+├── agent.py                  # entrypoint — session setup, Assistant class,
+│                              #   retrieve_company_info + web_search_nxb tools
+├── prompts.py                # system instructions + welcome message
+├── ingest_api.py              # FastAPI: POST /ingest, GET /token
+├── services/
+│   ├── pdf_loader.py           # PDF loading + chunking
+│   ├── embeddings.py           # local sentence-transformers embedding wrapper
+│   ├── vector_store.py         # FAISS index wrapper
+│   └── kb_client.py            # retrieval client used by agent.py (lazy-loaded)
+├── data/
+│   ├── *.pdf                   # source PDFs
+│   └── faiss_index/             # generated: index.faiss + metadata.json
 └── pyproject.toml / uv.lock
+
+nxb-voice-frontend/
+├── app/
+│   └── page.tsx               # voice UI — connect button, visualizer, controls
+├── .env.local                 # token endpoint URL
+└── package.json
 ```
-
-## How it works
-
-The agent's only tool is `web_search_nxb`, which:
-1. Takes the user's question
-2. Prefixes it with "Nextbridge NXB" to keep results on-topic
-3. Searches via Tavily, restricted to `nextbridge.com`
-4. Returns summarized results for the LLM to speak back naturally
-
-The system prompt in `prompts.py` instructs the agent to only use this tool
-for Nextbridge-related questions, and to say honestly when it doesn't have
-an answer rather than guessing.
-
